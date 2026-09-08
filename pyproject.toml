@@ -1,0 +1,19 @@
+[project]
+name = "jira-agent-kit"
+version = "0.1.0"
+description = "Give a coding agent a Jira presence: create issues with a real template, read context in at session start, write a commit trail out, and see what's blocked on a human at a glance."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+jira-agent = "jira_agent_kit.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+markers = [
+    "jira_live: contacts the REAL Jira API with a REAL credential; skipped unless JIRA_AGENT_LIVE_TESTS=1",
+]
