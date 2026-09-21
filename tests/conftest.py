@@ -1,4 +1,4 @@
-"""Four guards, all load-bearing.
+"""Five guards, all load-bearing.
 
 1. `jira_live` tests are skipped unless JIRA_AGENT_LIVE_TESTS=1 is set.
 2. No test in this package may reach the real Jira, EXCEPT one carrying
@@ -6,6 +6,10 @@
 3. `jev_live` tests are skipped unless JIRA_AGENT_LIVE_TESTS=1 is set.
 4. No test in this package may reach the real Jev API, EXCEPT one carrying
    @pytest.mark.jev_live.
+5. No test in this package may write to the real telemetry store at
+   ~/.jira-agent/jae.db. Every test gets a per-test path instead,
+   unconditionally -- there is no opt-out marker, because unlike Jira/Jev
+   there is no legitimate reason a unit test ever needs the real one.
 
 WHY 1 AND 2 EXIST. An early version of this kit had neither. One test called
 the CLI's `create` command with an argument the vocabulary happened to
@@ -23,6 +27,18 @@ nothing to it: a Jev call would sail straight through the guard above and
 hit the real network, and the reason would not be obvious from the
 patched-httpx test failing to catch it. Both packages get their own guard,
 built the same way, on purpose.
+
+WHY 5 EXISTS, AND WHY IT WAS FOUND LATE. Several of `finish`'s own CLI
+tests set JIRA_AGENT_DB_PATH to a tmp_path -- but not all of them, because
+that was left as a per-test opt-in rather than a structural default. Every
+test that forgot wrote real rows, under the fake issue key "PROJ-12", into
+the real ~/.jira-agent/jae.db on the machine running the suite -- the exact
+same class of mistake guards 1-4 exist to prevent, just for the filesystem
+instead of the network. It went unnoticed for several commits because the
+suite still passed; nothing asserted on the real path, so nothing failed.
+Found only by inspecting the real database directly and seeing 135 "PROJ-12"
+rows sitting next to 9 real ones. Fixed the same way as 1-4: an autouse
+fixture, unconditional, not a convention to remember per test.
 """
 
 import os
@@ -99,3 +115,16 @@ def _no_live_jev(request, monkeypatch):
         )
 
     monkeypatch.setattr(httpx2.HTTPTransport, "handle_request", refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_default_telemetry_path(tmp_path, monkeypatch):
+    """Every test gets its own JIRA_AGENT_DB_PATH, unconditionally.
+
+    A test that wants a SPECIFIC tmp path (to open a TelemetryStore on the
+    same file the CLI wrote to and assert on it) still calls
+    `monkeypatch.setenv("JIRA_AGENT_DB_PATH", ...)` itself -- this fixture
+    only sets a DEFAULT so that a test which forgets still lands somewhere
+    harmless instead of the real ~/.jira-agent/jae.db.
+    """
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
