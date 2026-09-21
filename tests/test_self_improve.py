@@ -72,15 +72,35 @@ def test_a_custom_min_sample_can_be_lower(tmp_path):
     assert len(batch) > 0
 
 
-def test_bottom_third_selects_only_the_lowest_scoring_tasks(tmp_path):
+def test_bottom_third_selects_the_worst_scoring_tasks_the_highest_numbers(tmp_path):
+    """Every dimension in judge.DIMENSIONS orders its criteria good-to-bad:
+    a LOW score means good (e.g. "no redundant tests"), a HIGH score means
+    bad (e.g. "most tests are redundant"). "Worst third" must select the
+    HIGH scores, not the low ones -- the inverted version of this shipped
+    once, caught only by running it against real Jev output where every
+    real low score turned out to mean "good."
+    """
     store = TelemetryStore(tmp_path / "jae.db")
-    # 30 tasks: 15 scored 0.0 (bad), 15 scored 2.0 (good).
+    # 30 tasks: 15 scored 0.0 (good -- no redundant tests), 15 scored 2.0 (bad -- most are redundant).
     _fill(store, repo="r", dimension="redundant_tests", n=30)
 
     batch = bottom_third(store, dimension="redundant_tests", repo="r")
 
-    assert all(t.score == pytest.approx(0.0) for t in batch)
+    assert all(t.score == pytest.approx(2.0) for t in batch)
     assert len(batch) == 10  # 30 // 3
+
+
+def test_selecting_the_low_scores_instead_would_fail_the_test_above(tmp_path):
+    """Mutation-shaped control: proves the assertion above discriminates.
+    This is the literal bug that shipped -- reverse=True removed.
+    """
+    store = TelemetryStore(tmp_path / "jae.db")
+    _fill(store, repo="r", dimension="redundant_tests", n=30)
+    rows = store.scores(repo="r", dimension="redundant_tests")
+
+    wrongly_selected = sorted(rows, key=lambda r: r["score"])[: max(1, len(rows) // 3)]
+
+    assert all(r["score"] == pytest.approx(0.0) for r in wrongly_selected)  # confirms the bug's actual behavior
 
 
 def test_repo_none_pools_across_every_repo(tmp_path):

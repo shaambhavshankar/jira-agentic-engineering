@@ -74,7 +74,18 @@ def bottom_third(
     repo: str | None = None,
     min_sample: int = MIN_SAMPLE,
 ) -> tuple[ScoredTask, ...]:
-    """The lowest-scoring third of recorded scores for `dimension`.
+    """The WORST-scoring third of recorded scores for `dimension`.
+
+    "Worst" is the HIGHEST score, not the lowest. Every dimension in
+    judge.DIMENSIONS orders its criteria good-to-bad (index 0 is the good
+    outcome, the top index is the bad one), so a Score answer near 0 means
+    "no problem found" and a score near the top means "the bad case." A
+    version of this function that sorted ascending and took the low end
+    would select the BEST-performing tasks, backwards from the whole
+    point -- caught only by actually running this against real Jev
+    scores, where every real "low" score turned out to mean "good," not
+    "poor." The name `bottom_third` describes the quality tier (the
+    worst-performing slice), not the numeric direction of the sort.
 
     `repo=None` pools across every repo in the store -- a pattern too
     small to clear `min_sample` in any one repo alone can still be real
@@ -90,7 +101,7 @@ def bottom_third(
             "Fewer than this overcorrects on noise -- score more tasks first."
         )
 
-    ordered = sorted(rows, key=lambda r: r["score"])
+    ordered = sorted(rows, key=lambda r: r["score"], reverse=True)
     cutoff = max(1, len(ordered) // 3)
     bottom = ordered[:cutoff]
     return tuple(

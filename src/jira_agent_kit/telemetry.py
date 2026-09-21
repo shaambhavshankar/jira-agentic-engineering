@@ -44,6 +44,14 @@ __all__ = [
 
 DEFAULT_DB_PATH = Path.home() / ".jira-agent" / "jae.db"
 
+# The DB-column value standing in for "no factory_version" (a live score),
+# so the column is never actually NULL. See record_score's docstring: a
+# NULL column in a PRIMARY KEY never collides with another NULL under
+# standard SQL, which broke upserting a live score twice. No real tag
+# starts with a null byte, so this cannot collide with a real
+# `factory-vN` value.
+_LIVE_SENTINEL = "\x00live"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS task_records (
     issue_key           TEXT NOT NULL,
@@ -213,7 +221,17 @@ class TelemetryStore:
         a tag like "factory-v2" marks a replay (§7.2) -- both are kept,
         never overwriting each other, because replay's whole point is
         comparing a live score against a replayed one.
+
+        Stores `None` as `_LIVE_SENTINEL`, not SQL NULL. Standard SQL
+        treats every NULL in a PRIMARY KEY as distinct from every other
+        NULL -- including a second NULL for the exact same row -- so
+        `ON CONFLICT` on a column that can be NULL never fires for two
+        live scores of the same task. A real duplicate-row bug, found by
+        actually re-scoring the same real issue twice. A non-NULL
+        sentinel is an ordinary value, and ordinary values DO collide on
+        a PRIMARY KEY as expected.
         """
+        stored_version = factory_version if factory_version is not None else _LIVE_SENTINEL
         self._conn.execute(
             """
             INSERT INTO scores (
@@ -224,7 +242,7 @@ class TelemetryStore:
             DO UPDATE SET score=excluded.score, confidence=excluded.confidence,
                           scored_at=excluded.scored_at
             """,
-            (repo, issue_key, session_id, dimension, score, confidence, factory_version),
+            (repo, issue_key, session_id, dimension, score, confidence, stored_version),
         )
         self._conn.commit()
 
@@ -245,7 +263,13 @@ class TelemetryStore:
             f"SELECT * FROM scores {where} ORDER BY scored_at", params
         ).fetchall()
         columns = [d[0] for d in self._conn.execute("SELECT * FROM scores LIMIT 0").description]
-        return tuple(dict(zip(columns, row)) for row in rows)
+        result = []
+        for row in rows:
+            record = dict(zip(columns, row))
+            if record["factory_version"] == _LIVE_SENTINEL:
+                record["factory_version"] = None
+            result.append(record)
+        return tuple(result)
 
 
 def _row_to_task(row: Sequence) -> TaskRecord:

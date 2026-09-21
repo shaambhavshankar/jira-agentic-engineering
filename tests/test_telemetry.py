@@ -258,6 +258,30 @@ def test_a_live_score_and_a_replay_score_for_the_same_task_are_both_kept(tmp_pat
     assert len(store.scores()) == 2
 
 
+def test_recording_the_same_live_score_twice_upserts_not_duplicates(tmp_path):
+    """Real bug, found by actually running the real pipeline twice against
+    the same real issue: standard SQL treats each NULL in a PRIMARY KEY as
+    distinct from every other NULL, including itself -- so two live scores
+    (factory_version=None both times) for the exact same task never
+    collided on the PK, and ON CONFLICT never fired. Every re-score of a
+    live task silently duplicated instead of updating.
+    """
+    store = TelemetryStore(tmp_path / "jae.db")
+    store.record_score(
+        repo="r", issue_key="X-1", session_id="a",
+        dimension="redundant_tests", score=1.0, confidence=0.9,
+    )
+    store.record_score(
+        repo="r", issue_key="X-1", session_id="a",
+        dimension="redundant_tests", score=0.3, confidence=0.95,
+    )
+
+    rows = store.scores(repo="r", dimension="redundant_tests")
+
+    assert len(rows) == 1
+    assert rows[0]["score"] == pytest.approx(0.3)
+
+
 # --- repo_name: derived from git remote, not typed by hand -----------------
 
 
