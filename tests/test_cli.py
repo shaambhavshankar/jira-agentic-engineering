@@ -1141,3 +1141,86 @@ def test_replay_with_a_missing_score_is_misuse_not_a_crash(monkeypatch, tmp_path
 
     assert code == cli.EXIT_MISUSE
     assert "no redundant_tests score" in capsys.readouterr().err
+
+
+# --- self-improve-batch / self-improve-propose (JAE v2 spec §6) -------------------------
+
+
+def _fill_scores(store, *, repo, dimension, n):
+    for i in range(n):
+        score = 0.0 if i % 2 == 0 else 2.0
+        store.record_score(
+            repo=repo, issue_key=f"A-{i}", session_id=f"s{i}",
+            dimension=dimension, score=score, confidence=0.9,
+        )
+
+
+def test_self_improve_batch_refuses_below_the_minimum_sample(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    _fill_scores(store, repo="repo-a", dimension="redundant_tests", n=5)
+    store.close()
+
+    code = cli.main(["self-improve-batch", "--dimension", "redundant_tests", "--repo-name", "repo-a"])
+
+    assert code == cli.EXIT_MISUSE
+    assert "only 5" in capsys.readouterr().err
+
+
+def test_self_improve_batch_prints_the_observer_prompt(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    _fill_scores(store, repo="repo-a", dimension="redundant_tests", n=20)
+    store.close()
+
+    code = cli.main(["self-improve-batch", "--dimension", "redundant_tests", "--repo-name", "repo-a"])
+
+    assert code == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "redundant_tests" in out
+    assert "do not apply" in out.lower()
+
+
+def test_self_improve_propose_creates_an_issue_from_a_proposal_file(monkeypatch, tmp_path):
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    _fill_scores(store, repo="repo-a", dimension="redundant_tests", n=20)
+    store.close()
+
+    proposal_file = tmp_path / "proposal.txt"
+    proposal_file.write_text("Add a rule: one test per behaviour, not per assertion.")
+
+    code = cli.main(
+        [
+            "self-improve-propose", "--dimension", "redundant_tests",
+            "--repo-name", "repo-a", "--proposal-file", str(proposal_file),
+        ]
+    )
+
+    assert code == cli.EXIT_OK
+    assert fake.created is not None
+    assert "self-improvement proposal" in fake.created["summary"].lower()
+
+
+def test_self_improve_propose_refuses_below_minimum_without_creating_anything(monkeypatch, tmp_path):
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    _fill_scores(store, repo="repo-a", dimension="redundant_tests", n=3)
+    store.close()
+
+    proposal_file = tmp_path / "proposal.txt"
+    proposal_file.write_text("x")
+
+    code = cli.main(
+        [
+            "self-improve-propose", "--dimension", "redundant_tests",
+            "--repo-name", "repo-a", "--proposal-file", str(proposal_file),
+        ]
+    )
+
+    assert code == cli.EXIT_MISUSE
+    assert fake.created is None

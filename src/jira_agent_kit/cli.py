@@ -15,6 +15,8 @@
     jira-agent factory-version list
     jira-agent replay --repo-name NAME --issue KEY --session ID --dimension D \
         [--from-version factory-vN] [--to-version factory-vM]
+    jira-agent self-improve-batch --dimension D [--repo-name NAME] [--min-sample N]
+    jira-agent self-improve-propose --dimension D [--repo-name NAME] --proposal-file path
     jira-agent whoami
     jira-agent lint some-file.md
 
@@ -41,7 +43,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
-from jira_agent_kit import context, dashboard as dash, factory_dashboard, judge as judge_mod, schema, telemetry, versioning
+from jira_agent_kit import context, dashboard as dash, factory_dashboard, judge as judge_mod, schema, self_improve, telemetry, versioning
 from jira_agent_kit.client import JiraClient, JiraError, TokenMissing, read_token
 from jira_agent_kit.config import Config, ConfigError, load as load_config
 
@@ -120,6 +122,34 @@ def _parser(config: Config) -> argparse.ArgumentParser:
     replay.add_argument("--dimension", required=True, choices=sorted(judge_mod.DIMENSIONS))
     replay.add_argument("--from-version", default=None, help="a factory-vN tag, or omit for the live score")
     replay.add_argument("--to-version", default=None, help="a factory-vN tag, or omit for the live score")
+
+    self_improve_batch = sub.add_parser(
+        "self-improve-batch",
+        help="select the bottom-third scored batch and print the observer prompt (does NOT call an LLM)",
+    )
+    self_improve_batch.add_argument("--dimension", required=True, choices=sorted(judge_mod.DIMENSIONS))
+    self_improve_batch.add_argument(
+        "--repo-name", default=None,
+        help="scope to one repo; omit to pool across every repo in the store",
+    )
+    self_improve_batch.add_argument(
+        "--min-sample", type=int, default=None,
+        help="override the default minimum sample size (20)",
+    )
+
+    self_improve_propose = sub.add_parser(
+        "self-improve-propose",
+        help="write an observer agent's proposal as a reviewable Jira issue (never applies it)",
+    )
+    self_improve_propose.add_argument("--dimension", required=True, choices=sorted(judge_mod.DIMENSIONS))
+    self_improve_propose.add_argument(
+        "--repo-name", default=None,
+        help="scope to one repo; omit to pool across every repo in the store",
+    )
+    self_improve_propose.add_argument(
+        "--proposal-file", required=True,
+        help="path to a file containing the observer agent's proposal text",
+    )
 
     transition = sub.add_parser("transition", help="move an issue to a new status")
     transition.add_argument("key")
@@ -734,6 +764,49 @@ def _do_replay(args) -> int:
     return EXIT_OK
 
 
+def _do_self_improve_batch(args) -> int:
+    """Select the batch and print the observer prompt. Does NOT call an
+    LLM -- copy the printed prompt into a real Claude Code session, save
+    what comes back to a file, then run `self-improve-propose` with it.
+    """
+    store = telemetry.TelemetryStore(_telemetry_db_path())
+    try:
+        try:
+            kwargs = {"dimension": args.dimension, "repo": args.repo_name}
+            if args.min_sample is not None:
+                kwargs["min_sample"] = args.min_sample
+            batch = self_improve.bottom_third(store, **kwargs)
+        except self_improve.SelfImproveError as error:
+            print(str(error), file=sys.stderr)
+            return EXIT_MISUSE
+    finally:
+        store.close()
+
+    print(self_improve.build_observer_prompt(args.dimension, batch))
+    return EXIT_OK
+
+
+def _do_self_improve_propose(args, config: Config, vocab: schema.Vocabulary) -> int:
+    store = telemetry.TelemetryStore(_telemetry_db_path())
+    try:
+        try:
+            batch = self_improve.bottom_third(store, dimension=args.dimension, repo=args.repo_name)
+        except self_improve.SelfImproveError as error:
+            print(str(error), file=sys.stderr)
+            return EXIT_MISUSE
+    finally:
+        store.close()
+
+    proposal_text = Path(args.proposal_file).read_text()
+    client = _client(config, args.email)
+    key = self_improve.propose_issue(
+        client, project_key=config.project_key, vocabulary=vocab,
+        dimension=args.dimension, batch=batch, proposal_text=proposal_text,
+    )
+    print(f"created {key}")
+    return EXIT_OK
+
+
 def _do_sprints(args, config: Config) -> int:
     client = _client(config, args.email)
     board_id = client.find_board_id(config.project_key)
@@ -757,7 +830,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.command:
         print("no command. Try: create, show, comment, block, start, finish, "
               "transition, sprints, dashboard, factory-dashboard, factory-version, "
-              "replay, whoami, lint", file=sys.stderr)
+              "replay, self-improve-batch, self-improve-propose, whoami, lint", file=sys.stderr)
         return EXIT_MISUSE
 
     vocab = schema.Vocabulary(config.label_prefix)
@@ -804,6 +877,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "replay":
             return _do_replay(args)
+
+        if args.command == "self-improve-batch":
+            return _do_self_improve_batch(args)
+
+        if args.command == "self-improve-propose":
+            return _do_self_improve_propose(args, config, vocab)
 
         if args.command == "sprints":
             return _do_sprints(args, config)
