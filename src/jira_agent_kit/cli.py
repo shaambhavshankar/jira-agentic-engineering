@@ -37,7 +37,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
-from jira_agent_kit import context, dashboard as dash, factory_dashboard, schema, telemetry
+from jira_agent_kit import context, dashboard as dash, factory_dashboard, judge as judge_mod, schema, telemetry
 from jira_agent_kit.client import JiraClient, JiraError, TokenMissing, read_token
 from jira_agent_kit.config import Config, ConfigError, load as load_config
 
@@ -345,21 +345,32 @@ def _telemetry_db_path() -> Path:
     return Path(raw) if raw else telemetry.DEFAULT_DB_PATH
 
 
-def _record_telemetry(
+def _judge_sample_rate() -> float:
+    raw = os.environ.get("JIRA_AGENT_JUDGE_SAMPLE_RATE", "").strip()
+    return float(raw) if raw else 0.20  # owner-approved default, spec §5.4/§8.3
+
+
+def _record_telemetry_and_score(
     *,
     key: str,
     repo_path: str,
     files_changed: Sequence[str],
     test_exit_code: int,
     contract_exit_code: int | None,
+    judge_state: str,
 ) -> None:
-    """Write one TaskRecord for this `finish` call. Best-effort, always.
+    """Write one TaskRecord for this `finish` call, and -- if this issue
+    is sampled -- score it on every dimension in judge.DIMENSIONS. Both
+    best-effort, always: neither a telemetry write nor a Jev call is
+    allowed to fail `finish`, the same non-blocking rule every network
+    call in this kit already follows. Errors are swallowed here, not
+    silently -- a warning goes to stderr, same as a lint finding.
 
-    Never allowed to fail `finish`: a telemetry write is exactly the kind
-    of side channel that must not turn a successful Jira post into a
-    failed command, the same non-blocking rule every network call in this
-    kit already follows. Errors are swallowed here, not silently -- a
-    warning goes to stderr, same as a lint finding.
+    One try/except around both, not two: `session_id` is generated once
+    and shared, so a score written here always matches the task_record it
+    belongs to (both tables key on `session_id`). Splitting this into two
+    independently-failing helpers would risk a score with no matching task
+    if telemetry succeeded, session_id changed, then judging ran separately.
     """
     try:
         repo = telemetry.repo_name(repo_path)
@@ -389,10 +400,25 @@ def _record_telemetry(
                     cost_usd=None,  # not available at this layer yet
                 )
             )
+
+            if judge_mod.should_sample(key, _judge_sample_rate()):
+                jev = judge_mod.JevJudge()
+                for dimension in judge_mod.DIMENSIONS:
+                    result = jev.score(dimension, judge_state)
+                    if result.action == "discard":  # confidence < 0.5: not evidence, not written
+                        continue
+                    store.record_score(
+                        repo=repo,
+                        issue_key=key,
+                        session_id=session_id,
+                        dimension=result.dimension,
+                        score=result.score,
+                        confidence=result.confidence,
+                    )
         finally:
             store.close()
     except Exception as error:  # noqa: BLE001 -- deliberately broad, see docstring
-        print(f"telemetry write failed (finish still succeeded): {error}", file=sys.stderr)
+        print(f"telemetry/judge write failed (finish still succeeded): {error}", file=sys.stderr)
 
 
 def _do_transition(args, config: Config) -> int:
@@ -559,12 +585,13 @@ def _do_finish(args, config: Config) -> int:
     if hurt:
         client.add_labels(args.key, list(hurt), vocab)
 
-    _record_telemetry(
+    _record_telemetry_and_score(
         key=args.key,
         repo_path=args.repo,
         files_changed=sorted(actual),
         test_exit_code=verdict.exit_code,
         contract_exit_code=contract_result.exit_code if args.contract_cmd else None,
+        judge_state="\n".join(lines),
     )
 
     print(f"posted finish report on {args.key}" + (f", labelled {', '.join(hurt)}" if hurt else ""))

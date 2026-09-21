@@ -19,6 +19,12 @@ def _config_env(monkeypatch):
     monkeypatch.setenv("JIRA_AGENT_EMAIL", "t@example.com")
     monkeypatch.setenv("JIRA_AGENT_LABEL_PREFIX", "eng")
     monkeypatch.delenv("JIRA_AGENT_KEYCHAIN_SERVICE", raising=False)
+    # Off by default: `finish` samples issues by hashing the issue key, so
+    # an unrelated test (e.g. "PROJ-12") could otherwise non-deterministically
+    # trigger a real Jev call attempt depending on which key it happens to
+    # use. Tests that specifically exercise judge wiring set this to "1"
+    # themselves and stub JevJudge -- see the judge-wiring section below.
+    monkeypatch.setenv("JIRA_AGENT_JUDGE_SAMPLE_RATE", "0")
 
 
 class _RecordingClient:
@@ -860,6 +866,164 @@ def test_factory_dashboard_scoped_to_one_repo_excludes_others(monkeypatch, tmp_p
     # scoped to one repo: no per-repo breakdown table beyond the overall row,
     # and the pooled repo-b row must not appear
     assert "repo-b" not in text
+
+
+# --- finish: judge scoring wiring (JAE v2 spec §5) --------------------------------------
+
+
+class _StubJudge:
+    """Replaces JevJudge entirely -- no network, no real Jev SDK call.
+    Returns a fixed result per dimension, settable per test.
+    """
+
+    def __init__(self, results):
+        self._results = results  # dict[dimension] -> cli.judge_mod.JudgeResult
+
+    def score(self, dimension, state):
+        return self._results[dimension]
+
+
+def _judge_result(dimension, score, confidence, action):
+    return cli.judge_mod.JudgeResult(dimension=dimension, score=score, confidence=confidence, action=action)
+
+
+def test_a_sampled_issue_gets_scored_on_every_dimension(monkeypatch, tmp_path):
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setattr(cli.context, "changed_files", lambda rev, repo: ())
+    monkeypatch.setattr(cli.telemetry, "repo_name", lambda repo: "test-repo")
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    monkeypatch.setenv("JIRA_AGENT_JUDGE_SAMPLE_RATE", "1")  # always sample
+
+    stub = _StubJudge({
+        "redundant_tests": _judge_result("redundant_tests", 0.0, 0.95, "write"),
+        "scope_creep": _judge_result("scope_creep", 1.0, 0.95, "write"),
+        "prediction_accuracy": _judge_result("prediction_accuracy", 0.0, 0.95, "write"),
+    })
+    monkeypatch.setattr(cli.judge_mod, "JevJudge", lambda: stub)
+
+    cli.main(
+        [
+            "finish", "PROJ-12", "--test-cmd", "true", "--predicted", "",
+            "--accuracy", "Same|x.", "--scalability", "Same|x.", "--maintenance", "Same|x.",
+            "--left", "nothing",
+        ]
+    )
+
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    scores = store.scores(repo="test-repo")
+    assert {s["dimension"] for s in scores} == {"redundant_tests", "scope_creep", "prediction_accuracy"}
+
+
+def test_a_discarded_low_confidence_score_is_not_written(monkeypatch, tmp_path):
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setattr(cli.context, "changed_files", lambda rev, repo: ())
+    monkeypatch.setattr(cli.telemetry, "repo_name", lambda repo: "test-repo")
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    monkeypatch.setenv("JIRA_AGENT_JUDGE_SAMPLE_RATE", "1")
+
+    stub = _StubJudge({
+        "redundant_tests": _judge_result("redundant_tests", 0.0, 0.2, "discard"),
+        "scope_creep": _judge_result("scope_creep", 1.0, 0.95, "write"),
+        "prediction_accuracy": _judge_result("prediction_accuracy", 0.0, 0.95, "write"),
+    })
+    monkeypatch.setattr(cli.judge_mod, "JevJudge", lambda: stub)
+
+    cli.main(
+        [
+            "finish", "PROJ-12", "--test-cmd", "true", "--predicted", "",
+            "--accuracy", "Same|x.", "--scalability", "Same|x.", "--maintenance", "Same|x.",
+            "--left", "nothing",
+        ]
+    )
+
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    scores = store.scores(repo="test-repo")
+    assert "redundant_tests" not in {s["dimension"] for s in scores}
+
+
+def test_writing_the_discarded_score_anyway_would_fail_the_test_above(monkeypatch, tmp_path):
+    """Mutation-shaped control: proves the assertion above discriminates."""
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setattr(cli.context, "changed_files", lambda rev, repo: ())
+    monkeypatch.setattr(cli.telemetry, "repo_name", lambda repo: "test-repo")
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    monkeypatch.setenv("JIRA_AGENT_JUDGE_SAMPLE_RATE", "1")
+
+    # Simulate the bug: the "discard" action written anyway (mutated to "write").
+    stub = _StubJudge({
+        "redundant_tests": _judge_result("redundant_tests", 0.0, 0.2, "write"),
+        "scope_creep": _judge_result("scope_creep", 1.0, 0.95, "write"),
+        "prediction_accuracy": _judge_result("prediction_accuracy", 0.0, 0.95, "write"),
+    })
+    monkeypatch.setattr(cli.judge_mod, "JevJudge", lambda: stub)
+
+    cli.main(
+        [
+            "finish", "PROJ-12", "--test-cmd", "true", "--predicted", "",
+            "--accuracy", "Same|x.", "--scalability", "Same|x.", "--maintenance", "Same|x.",
+            "--left", "nothing",
+        ]
+    )
+
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    scores = store.scores(repo="test-repo")
+    assert "redundant_tests" in {s["dimension"] for s in scores}  # confirms the mutation is visible
+
+
+def test_an_unsampled_issue_is_not_scored_at_all(monkeypatch, tmp_path):
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setattr(cli.context, "changed_files", lambda rev, repo: ())
+    monkeypatch.setattr(cli.telemetry, "repo_name", lambda repo: "test-repo")
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    monkeypatch.setenv("JIRA_AGENT_JUDGE_SAMPLE_RATE", "0")  # never sample
+
+    def fail_if_constructed():
+        pytest.fail("JevJudge constructed for an unsampled issue")
+
+    monkeypatch.setattr(cli.judge_mod, "JevJudge", fail_if_constructed)
+
+    code = cli.main(
+        [
+            "finish", "PROJ-12", "--test-cmd", "true", "--predicted", "",
+            "--accuracy", "Same|x.", "--scalability", "Same|x.", "--maintenance", "Same|x.",
+            "--left", "nothing",
+        ]
+    )
+
+    assert code == cli.EXIT_OK  # no judge call attempted, no crash either
+
+
+def test_finish_still_succeeds_when_judge_scoring_raises(monkeypatch, tmp_path):
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setattr(cli.context, "changed_files", lambda rev, repo: ())
+    monkeypatch.setattr(cli.telemetry, "repo_name", lambda repo: "test-repo")
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    monkeypatch.setenv("JIRA_AGENT_JUDGE_SAMPLE_RATE", "1")
+
+    class RaisingJudge:
+        def score(self, dimension, state):
+            raise RuntimeError("simulated Jev outage")
+
+    monkeypatch.setattr(cli.judge_mod, "JevJudge", lambda: RaisingJudge())
+
+    code = cli.main(
+        [
+            "finish", "PROJ-12", "--test-cmd", "true", "--predicted", "",
+            "--accuracy", "Same|x.", "--scalability", "Same|x.", "--maintenance", "Same|x.",
+            "--left", "nothing",
+        ]
+    )
+
+    assert code == cli.EXIT_OK
+    assert len(fake.comments) == 1  # the report still posted
+    # the telemetry row still recorded -- judge's failure doesn't unwind it
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    assert len(store.tasks(repo="test-repo")) == 1
 
 
 def test_factory_dashboard_pooled_view_shows_the_breakdown(monkeypatch, tmp_path):
