@@ -27,13 +27,16 @@ EXIT CODES:
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
+import uuid
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 
-from jira_agent_kit import context, dashboard as dash, schema
+from jira_agent_kit import context, dashboard as dash, schema, telemetry
 from jira_agent_kit.client import JiraClient, JiraError, TokenMissing, read_token
 from jira_agent_kit.config import Config, ConfigError, load as load_config
 
@@ -315,6 +318,69 @@ def _do_create(args, config: Config, vocab: schema.Vocabulary) -> int:
     return EXIT_OK
 
 
+def _telemetry_db_path() -> Path:
+    """`JIRA_AGENT_DB_PATH` if set, else the shared multi-repo default.
+
+    A separate env var, not folded into Config: the telemetry store is not
+    company-specific the way site/project/email are -- it is a local
+    machine path, and every repo on one machine shares the same one by
+    design (spec §3.4). Overridable for tests and for anyone who wants a
+    non-default location.
+    """
+    raw = os.environ.get("JIRA_AGENT_DB_PATH", "").strip()
+    return Path(raw) if raw else telemetry.DEFAULT_DB_PATH
+
+
+def _record_telemetry(
+    *,
+    key: str,
+    repo_path: str,
+    files_changed: Sequence[str],
+    test_exit_code: int,
+    contract_exit_code: int | None,
+) -> None:
+    """Write one TaskRecord for this `finish` call. Best-effort, always.
+
+    Never allowed to fail `finish`: a telemetry write is exactly the kind
+    of side channel that must not turn a successful Jira post into a
+    failed command, the same non-blocking rule every network call in this
+    kit already follows. Errors are swallowed here, not silently -- a
+    warning goes to stderr, same as a lint finding.
+    """
+    try:
+        repo = telemetry.repo_name(repo_path)
+        session_id = os.environ.get("JIRA_AGENT_SESSION_ID", "").strip() or uuid.uuid4().hex
+        model = os.environ.get("JIRA_AGENT_MODEL", "").strip() or "unknown"
+        now = datetime.now(timezone.utc)
+        try:
+            authored = context.git(["log", "-1", "--format=%aI", "HEAD"], repo_path)
+            started_at = datetime.fromisoformat(authored)
+        except (subprocess.CalledProcessError, ValueError):
+            started_at = now  # best-effort: an approximation, not a fabrication
+
+        store = telemetry.TelemetryStore(_telemetry_db_path())
+        try:
+            store.record(
+                telemetry.TaskRecord(
+                    issue_key=key,
+                    repo=repo,
+                    session_id=session_id,
+                    started_at=started_at,
+                    finished_at=now,
+                    model=model,
+                    files_changed=tuple(files_changed),
+                    test_exit_code=test_exit_code,
+                    contract_exit_code=contract_exit_code,
+                    human_interactions=0,  # computed later, by the dashboard (spec §4.2)
+                    cost_usd=None,  # not available at this layer yet
+                )
+            )
+        finally:
+            store.close()
+    except Exception as error:  # noqa: BLE001 -- deliberately broad, see docstring
+        print(f"telemetry write failed (finish still succeeded): {error}", file=sys.stderr)
+
+
 def _do_transition(args, config: Config) -> int:
     """Move an issue to a new status by NAME, matched case-insensitively.
 
@@ -478,6 +544,14 @@ def _do_finish(args, config: Config) -> int:
     hurt = axes.hurt_labels(vocab)
     if hurt:
         client.add_labels(args.key, list(hurt), vocab)
+
+    _record_telemetry(
+        key=args.key,
+        repo_path=args.repo,
+        files_changed=sorted(actual),
+        test_exit_code=verdict.exit_code,
+        contract_exit_code=contract_result.exit_code if args.contract_cmd else None,
+    )
 
     print(f"posted finish report on {args.key}" + (f", labelled {', '.join(hurt)}" if hurt else ""))
     return EXIT_OK

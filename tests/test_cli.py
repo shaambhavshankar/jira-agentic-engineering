@@ -602,6 +602,79 @@ def test_finish_runs_an_optional_second_check_and_reports_its_exit_code(monkeypa
     assert "exit 3" in text
 
 
+# --- finish: telemetry (JAE v2 spec §3) ------------------------------------------------
+
+
+def test_finish_records_a_telemetry_row(monkeypatch, tmp_path):
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setattr(cli.context, "changed_files", lambda rev, repo: ("a.py",))
+    monkeypatch.setattr(cli.telemetry, "repo_name", lambda repo: "test-repo")
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+
+    cli.main(
+        [
+            "finish", "PROJ-12", "--test-cmd", "true", "--predicted", "a.py",
+            "--accuracy", "Same|x.", "--scalability", "Same|x.", "--maintenance", "Same|x.",
+            "--left", "nothing",
+        ]
+    )
+
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    tasks = store.tasks(repo="test-repo")
+    assert len(tasks) == 1
+    assert tasks[0].issue_key == "PROJ-12"
+    assert tasks[0].test_exit_code == 0
+    assert tasks[0].files_changed == ("a.py",)
+
+
+def test_finish_telemetry_records_a_nonzero_test_exit_code(monkeypatch, tmp_path):
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setattr(cli.context, "changed_files", lambda rev, repo: ())
+    monkeypatch.setattr(cli.telemetry, "repo_name", lambda repo: "test-repo")
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+
+    cli.main(
+        [
+            "finish", "PROJ-12",
+            "--test-cmd", "python3 -c \"import sys; sys.exit(1)\"",
+            "--predicted", "",
+            "--accuracy", "Same|x.", "--scalability", "Same|x.", "--maintenance", "Same|x.",
+            "--left", "nothing",
+        ]
+    )
+
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    assert store.tasks(repo="test-repo")[0].test_exit_code == 1
+
+
+def test_finish_still_posts_the_report_when_telemetry_cannot_be_written(monkeypatch, tmp_path):
+    """Best-effort, per spec §3.2: a telemetry write failure must never fail
+    the finish command the way a Jira or network failure never does either.
+    """
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setattr(cli.context, "changed_files", lambda rev, repo: ())
+
+    def _raise_repo_name(repo):
+        raise ValueError("no 'origin' remote")
+
+    monkeypatch.setattr(cli.telemetry, "repo_name", _raise_repo_name)
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+
+    code = cli.main(
+        [
+            "finish", "PROJ-12", "--test-cmd", "true", "--predicted", "",
+            "--accuracy", "Same|x.", "--scalability", "Same|x.", "--maintenance", "Same|x.",
+            "--left", "nothing",
+        ]
+    )
+
+    assert code == cli.EXIT_OK
+    assert len(fake.comments) == 1  # the report still posted
+
+
 # --- sprints / dashboard --------------------------------------------------------------
 
 
