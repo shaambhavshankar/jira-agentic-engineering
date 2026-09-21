@@ -150,6 +150,10 @@ def _parser(config: Config) -> argparse.ArgumentParser:
         "--proposal-file", required=True,
         help="path to a file containing the observer agent's proposal text",
     )
+    self_improve_propose.add_argument(
+        "--min-sample", type=int, default=None,
+        help="override the default minimum sample size (20)",
+    )
 
     transition = sub.add_parser("transition", help="move an issue to a new status")
     transition.add_argument("key")
@@ -790,7 +794,10 @@ def _do_self_improve_propose(args, config: Config, vocab: schema.Vocabulary) -> 
     store = telemetry.TelemetryStore(_telemetry_db_path())
     try:
         try:
-            batch = self_improve.bottom_third(store, dimension=args.dimension, repo=args.repo_name)
+            kwargs = {"dimension": args.dimension, "repo": args.repo_name}
+            if args.min_sample is not None:
+                kwargs["min_sample"] = args.min_sample
+            batch = self_improve.bottom_third(store, **kwargs)
         except self_improve.SelfImproveError as error:
             print(str(error), file=sys.stderr)
             return EXIT_MISUSE

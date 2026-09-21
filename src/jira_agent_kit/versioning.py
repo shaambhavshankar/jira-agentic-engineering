@@ -79,21 +79,32 @@ def tag_factory_version(name: str, *, note: str, repo_path: Path | str = ".") ->
 
 
 def list_factory_versions(repo_path: Path | str = ".") -> tuple[TagInfo, ...]:
-    """Every `factory-*` tag in this repo, with its annotation note."""
+    """Every `factory-*` tag in this repo, with its annotation note.
+
+    Uses `git for-each-ref`, not `git tag -n99`. `-n99` prints a
+    CONTINUATION line for every extra line of a multi-line annotation --
+    indented, with no tag name -- and a naive per-line parser that tries
+    `line.partition(" ")` on one of those reads an empty tag name (a line
+    starting with whitespace partitions to "" at the very first space),
+    which then crashed `git rev-parse ''`. Real bug, found running this
+    against `factory-v1`'s own multi-line note. `for-each-ref` with
+    `%(contents:subject)` gives exactly one line per tag -- the note is
+    truncated to its first line here as a result; the full message is
+    still on the tag itself, via `git show <tag>`, for anyone who needs it.
+    """
     out = subprocess.run(
-        ["git", "tag", "-l", "factory-*", "-n99"], cwd=str(repo_path),
-        capture_output=True, text=True, check=True,
+        [
+            "git", "for-each-ref",
+            "--format=%(refname:short)|%(objectname)|%(contents:subject)",
+            "refs/tags/factory-*",
+        ],
+        cwd=str(repo_path), capture_output=True, text=True, check=True,
     ).stdout
     versions = []
     for line in out.splitlines():
         if not line.strip():
             continue
-        tag, _, note = line.partition(" ")
-        note = note.strip()
-        sha = subprocess.run(
-            ["git", "rev-parse", tag], cwd=str(repo_path),
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
+        tag, sha, note = line.split("|", 2)
         versions.append(TagInfo(tag=tag, sha=sha, note=note))
     return tuple(versions)
 

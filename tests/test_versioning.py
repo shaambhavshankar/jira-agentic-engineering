@@ -82,6 +82,29 @@ def test_list_factory_versions_is_empty_with_no_tags(repo):
     assert list_factory_versions(repo_path=repo) == ()
 
 
+def test_list_factory_versions_survives_a_multi_line_note(repo):
+    """Real bug, found running this for real against factory-v1's own
+    multi-line annotation. `git tag -n99` prints a CONTINUATION line for
+    each extra line of a multi-line message, indented and with no tag
+    name prefix. The old parser tried `line.partition(" ")` on every
+    non-blank line including those continuations -- a line beginning with
+    leading whitespace partitions to an EMPTY tag name at the first space,
+    which then got handed straight to `git rev-parse ''` and crashed the
+    whole command, not just this one tag.
+    """
+    tag_factory_version(
+        "v1", repo_path=repo, note=(
+            "Line one of the note.\n\n"
+            "Line two, after a blank line, indented by git's own -n99 output."
+        ),
+    )
+    tag_factory_version("v2", repo_path=repo, note="a normal single-line note")
+
+    versions = list_factory_versions(repo_path=repo)
+
+    assert {v.tag for v in versions} == {"factory-v1", "factory-v2"}
+
+
 # --- score_under_version: tags a score with a factory_version ---------------
 
 

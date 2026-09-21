@@ -1204,6 +1204,35 @@ def test_self_improve_propose_creates_an_issue_from_a_proposal_file(monkeypatch,
     assert "self-improvement proposal" in fake.created["summary"].lower()
 
 
+def test_self_improve_propose_accepts_a_min_sample_override(monkeypatch, tmp_path):
+    """Real gap found running this for real: self-improve-batch always had
+    --min-sample; self-improve-propose didn't, so a real end-to-end
+    verification run (batch with an override, then propose) had no way
+    to actually finish -- propose fell straight through to the production
+    default of 20 no matter what batch had just used.
+    """
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    _fill_scores(store, repo="repo-a", dimension="redundant_tests", n=5)
+    store.close()
+
+    proposal_file = tmp_path / "proposal.txt"
+    proposal_file.write_text("x")
+
+    code = cli.main(
+        [
+            "self-improve-propose", "--dimension", "redundant_tests",
+            "--repo-name", "repo-a", "--proposal-file", str(proposal_file),
+            "--min-sample", "5",
+        ]
+    )
+
+    assert code == cli.EXIT_OK
+    assert fake.created is not None
+
+
 def test_self_improve_propose_refuses_below_minimum_without_creating_anything(monkeypatch, tmp_path):
     fake = _RecordingClient()
     monkeypatch.setattr(cli, "_client", lambda config, email: fake)
