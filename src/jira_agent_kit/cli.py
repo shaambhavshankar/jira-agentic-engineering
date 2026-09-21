@@ -11,6 +11,10 @@
     jira-agent sprints
     jira-agent dashboard [--apply]
     jira-agent factory-dashboard [--repo NAME] [--out path.html]
+    jira-agent factory-version tag NAME --note "..."
+    jira-agent factory-version list
+    jira-agent replay --repo-name NAME --issue KEY --session ID --dimension D \
+        [--from-version factory-vN] [--to-version factory-vM]
     jira-agent whoami
     jira-agent lint some-file.md
 
@@ -37,7 +41,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
-from jira_agent_kit import context, dashboard as dash, factory_dashboard, judge as judge_mod, schema, telemetry
+from jira_agent_kit import context, dashboard as dash, factory_dashboard, judge as judge_mod, schema, telemetry, versioning
 from jira_agent_kit.client import JiraClient, JiraError, TokenMissing, read_token
 from jira_agent_kit.config import Config, ConfigError, load as load_config
 
@@ -97,6 +101,25 @@ def _parser(config: Config) -> argparse.ArgumentParser:
         "--out", default="factory-dashboard.html",
         help="output HTML file path",
     )
+
+    factory_version = sub.add_parser(
+        "factory-version", help="tag or list named snapshots of the factory definition"
+    )
+    fv_sub = factory_version.add_subparsers(dest="factory_version_command")
+    fv_tag = fv_sub.add_parser("tag", help="tag HEAD as factory-NAME")
+    fv_tag.add_argument("name")
+    fv_tag.add_argument("--note", required=True, help="what changed in this version")
+    fv_sub.add_parser("list", help="list every factory-* tag")
+
+    replay = sub.add_parser(
+        "replay", help="compare a task's judge score under two factory versions"
+    )
+    replay.add_argument("--repo-name", required=True, help="the repo tag in the telemetry store, e.g. eng-repo")
+    replay.add_argument("--issue", required=True, help="issue key, e.g. PROJ-12")
+    replay.add_argument("--session", required=True, help="session_id from telemetry, e.g. jira-agent factory-dashboard's underlying data")
+    replay.add_argument("--dimension", required=True, choices=sorted(judge_mod.DIMENSIONS))
+    replay.add_argument("--from-version", default=None, help="a factory-vN tag, or omit for the live score")
+    replay.add_argument("--to-version", default=None, help="a factory-vN tag, or omit for the live score")
 
     transition = sub.add_parser("transition", help="move an issue to a new status")
     transition.add_argument("key")
@@ -659,6 +682,58 @@ def _do_factory_dashboard(args) -> int:
     return EXIT_OK
 
 
+def _do_factory_version(args) -> int:
+    if args.factory_version_command == "tag":
+        try:
+            info = versioning.tag_factory_version(args.name, note=args.note, repo_path=args.repo)
+        except versioning.VersioningError as error:
+            print(str(error), file=sys.stderr)
+            return EXIT_MISUSE
+        print(f"tagged {info.tag}  {info.sha[:12]}  {info.note}")
+        return EXIT_OK
+
+    if args.factory_version_command == "list":
+        versions = versioning.list_factory_versions(repo_path=args.repo)
+        if not versions:
+            print("(no factory-* tags yet)")
+            return EXIT_OK
+        for v in versions:
+            print(f"{v.tag}  {v.sha[:12]}  {v.note}")
+        return EXIT_OK
+
+    print("no factory-version command. Try: tag, list", file=sys.stderr)
+    return EXIT_MISUSE
+
+
+def _do_replay(args) -> int:
+    store = telemetry.TelemetryStore(_telemetry_db_path())
+    try:
+        try:
+            delta = versioning.replay_delta(
+                store,
+                repo=args.repo_name,
+                issue_key=args.issue,
+                session_id=args.session,
+                dimension=args.dimension,
+                from_version=args.from_version,
+                to_version=args.to_version,
+            )
+        except versioning.VersioningError as error:
+            print(str(error), file=sys.stderr)
+            return EXIT_MISUSE
+    finally:
+        store.close()
+
+    sign = "+" if delta.delta >= 0 else ""
+    print(
+        f"{args.issue}  {args.dimension}  "
+        f"{delta.from_version or 'live'}={delta.from_score:.2f} -> "
+        f"{delta.to_version or 'live'}={delta.to_score:.2f}  "
+        f"delta={sign}{delta.delta:.2f}"
+    )
+    return EXIT_OK
+
+
 def _do_sprints(args, config: Config) -> int:
     client = _client(config, args.email)
     board_id = client.find_board_id(config.project_key)
@@ -681,7 +756,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if not args.command:
         print("no command. Try: create, show, comment, block, start, finish, "
-              "transition, sprints, dashboard, factory-dashboard, whoami, lint", file=sys.stderr)
+              "transition, sprints, dashboard, factory-dashboard, factory-version, "
+              "replay, whoami, lint", file=sys.stderr)
         return EXIT_MISUSE
 
     vocab = schema.Vocabulary(config.label_prefix)
@@ -722,6 +798,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "factory-dashboard":
             return _do_factory_dashboard(args)
+
+        if args.command == "factory-version":
+            return _do_factory_version(args)
+
+        if args.command == "replay":
+            return _do_replay(args)
 
         if args.command == "sprints":
             return _do_sprints(args, config)

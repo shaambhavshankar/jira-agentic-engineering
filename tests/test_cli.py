@@ -1051,3 +1051,93 @@ def test_factory_dashboard_pooled_view_shows_the_breakdown(monkeypatch, tmp_path
     text = out.read_text()
     assert "repo-a" in text
     assert "repo-b" in text
+
+
+# --- factory-version / replay (JAE v2 spec §7) -------------------------------------------
+
+
+@pytest.fixture
+def git_repo(tmp_path):
+    import subprocess
+    path = tmp_path / "repo"
+    path.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
+    (path / "a.txt").write_text("x")
+    subprocess.run(["git", "add", "a.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+    return path
+
+
+def test_factory_version_tag_creates_a_tag(git_repo, capsys):
+    code = cli.main(["--repo", str(git_repo), "factory-version", "tag", "v2", "--note", "risk field added"])
+
+    assert code == cli.EXIT_OK
+    assert "factory-v2" in capsys.readouterr().out
+
+
+def test_factory_version_tagging_twice_is_misuse_not_a_crash(git_repo, capsys):
+    cli.main(["--repo", str(git_repo), "factory-version", "tag", "v2", "--note", "first"])
+
+    code = cli.main(["--repo", str(git_repo), "factory-version", "tag", "v2", "--note", "second"])
+
+    assert code == cli.EXIT_MISUSE
+    assert "already exists" in capsys.readouterr().err
+
+
+def test_factory_version_list_shows_every_tag(git_repo, capsys):
+    cli.main(["--repo", str(git_repo), "factory-version", "tag", "v1", "--note", "baseline"])
+    cli.main(["--repo", str(git_repo), "factory-version", "tag", "v2", "--note", "next"])
+
+    code = cli.main(["--repo", str(git_repo), "factory-version", "list"])
+
+    assert code == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "factory-v1" in out and "factory-v2" in out
+
+
+def test_factory_version_list_with_no_tags_says_so(git_repo, capsys):
+    code = cli.main(["--repo", str(git_repo), "factory-version", "list"])
+
+    assert code == cli.EXIT_OK
+    assert "no factory" in capsys.readouterr().out.lower()
+
+
+def test_replay_reports_the_delta_between_two_scored_versions(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    store.record_score(
+        repo="repo-a", issue_key="A-1", session_id="s1", dimension="redundant_tests",
+        score=1.0, confidence=0.9, factory_version=None,
+    )
+    store.record_score(
+        repo="repo-a", issue_key="A-1", session_id="s1", dimension="redundant_tests",
+        score=0.2, confidence=0.9, factory_version="factory-v2",
+    )
+    store.close()
+
+    code = cli.main(
+        [
+            "replay", "--repo-name", "repo-a", "--issue", "A-1", "--session", "s1",
+            "--dimension", "redundant_tests", "--to-version", "factory-v2",
+        ]
+    )
+
+    assert code == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "1.00" in out and "0.20" in out and "-0.80" in out
+
+
+def test_replay_with_a_missing_score_is_misuse_not_a_crash(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+
+    code = cli.main(
+        [
+            "replay", "--repo-name", "repo-a", "--issue", "A-1", "--session", "s1",
+            "--dimension", "redundant_tests", "--to-version", "factory-v2",
+        ]
+    )
+
+    assert code == cli.EXIT_MISUSE
+    assert "no redundant_tests score" in capsys.readouterr().err
