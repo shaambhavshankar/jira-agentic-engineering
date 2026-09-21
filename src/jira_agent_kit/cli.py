@@ -10,6 +10,7 @@
     jira-agent transition PROJ-12 --to Done
     jira-agent sprints
     jira-agent dashboard [--apply]
+    jira-agent factory-dashboard [--repo NAME] [--out path.html]
     jira-agent whoami
     jira-agent lint some-file.md
 
@@ -36,7 +37,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
-from jira_agent_kit import context, dashboard as dash, schema, telemetry
+from jira_agent_kit import context, dashboard as dash, factory_dashboard, schema, telemetry
 from jira_agent_kit.client import JiraClient, JiraError, TokenMissing, read_token
 from jira_agent_kit.config import Config, ConfigError, load as load_config
 
@@ -82,6 +83,19 @@ def _parser(config: Config) -> argparse.ArgumentParser:
     dashboard.add_argument(
         "--apply", action="store_true",
         help="actually create them; without this it only prints the plan",
+    )
+
+    factory_dash = sub.add_parser(
+        "factory-dashboard",
+        help="render the manager dashboard (automation rate, cost, human interactions) from telemetry",
+    )
+    factory_dash.add_argument(
+        "--repo", default=None,
+        help="scope to one repo; omit for the pooled view across every repo in the store",
+    )
+    factory_dash.add_argument(
+        "--out", default="factory-dashboard.html",
+        help="output HTML file path",
     )
 
     transition = sub.add_parser("transition", help="move an issue to a new status")
@@ -600,6 +614,24 @@ def _do_dashboard(args, config: Config) -> int:
     return EXIT_OK
 
 
+def _do_factory_dashboard(args) -> int:
+    """Render the manager dashboard: `--repo` scopes to one repo; omitted,
+    it pools every repo in the shared telemetry store (spec §4.4).
+    """
+    store = telemetry.TelemetryStore(_telemetry_db_path())
+    try:
+        overall = factory_dashboard.compute_stats(store, repo=args.repo)
+        breakdown = () if args.repo else factory_dashboard.per_repo_breakdown(store)
+    finally:
+        store.close()
+
+    html = factory_dashboard.render_html(overall=overall, breakdown=breakdown)
+    Path(args.out).write_text(html)
+    scope = args.repo or "overall (pooled across every repo)"
+    print(f"wrote {args.out}  ({scope}, {overall.task_count} tasks)")
+    return EXIT_OK
+
+
 def _do_sprints(args, config: Config) -> int:
     client = _client(config, args.email)
     board_id = client.find_board_id(config.project_key)
@@ -622,7 +654,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if not args.command:
         print("no command. Try: create, show, comment, block, start, finish, "
-              "transition, sprints, dashboard, whoami, lint", file=sys.stderr)
+              "transition, sprints, dashboard, factory-dashboard, whoami, lint", file=sys.stderr)
         return EXIT_MISUSE
 
     vocab = schema.Vocabulary(config.label_prefix)
@@ -660,6 +692,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "dashboard":
             return _do_dashboard(args, config)
+
+        if args.command == "factory-dashboard":
+            return _do_factory_dashboard(args)
 
         if args.command == "sprints":
             return _do_sprints(args, config)

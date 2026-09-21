@@ -817,3 +817,73 @@ def test_whoami_reports_the_authenticated_identity(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_client", lambda config, email: FakeClient())
     assert cli.main(["whoami"]) == cli.EXIT_OK
     assert "someone@example.com" in capsys.readouterr().out
+
+
+# --- factory-dashboard -----------------------------------------------------------------
+
+
+def test_factory_dashboard_writes_html_for_an_empty_store(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    out = tmp_path / "out.html"
+
+    code = cli.main(["factory-dashboard", "--out", str(out)])
+
+    assert code == cli.EXIT_OK
+    assert out.exists()
+    assert "JAE factory dashboard" in out.read_text()
+
+
+def test_factory_dashboard_scoped_to_one_repo_excludes_others(monkeypatch, tmp_path):
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 9, 22, 10, 0, tzinfo=timezone.utc)
+    store.record(cli.telemetry.TaskRecord(
+        issue_key="A-1", repo="repo-a", session_id="s1", started_at=now, finished_at=now,
+        model="m", files_changed=(), test_exit_code=0, contract_exit_code=None,
+        human_interactions=0, cost_usd=None,
+    ))
+    store.record(cli.telemetry.TaskRecord(
+        issue_key="B-1", repo="repo-b", session_id="s2", started_at=now, finished_at=now,
+        model="m", files_changed=(), test_exit_code=0, contract_exit_code=None,
+        human_interactions=0, cost_usd=None,
+    ))
+    store.close()
+
+    out = tmp_path / "out.html"
+    code = cli.main(["factory-dashboard", "--repo", "repo-a", "--out", str(out)])
+
+    assert code == cli.EXIT_OK
+    text = out.read_text()
+    assert "repo-a" in text
+    # scoped to one repo: no per-repo breakdown table beyond the overall row,
+    # and the pooled repo-b row must not appear
+    assert "repo-b" not in text
+
+
+def test_factory_dashboard_pooled_view_shows_the_breakdown(monkeypatch, tmp_path):
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 9, 22, 10, 0, tzinfo=timezone.utc)
+    store.record(cli.telemetry.TaskRecord(
+        issue_key="A-1", repo="repo-a", session_id="s1", started_at=now, finished_at=now,
+        model="m", files_changed=(), test_exit_code=0, contract_exit_code=None,
+        human_interactions=0, cost_usd=None,
+    ))
+    store.record(cli.telemetry.TaskRecord(
+        issue_key="B-1", repo="repo-b", session_id="s2", started_at=now, finished_at=now,
+        model="m", files_changed=(), test_exit_code=0, contract_exit_code=None,
+        human_interactions=0, cost_usd=None,
+    ))
+    store.close()
+
+    out = tmp_path / "out.html"
+    code = cli.main(["factory-dashboard", "--out", str(out)])
+
+    assert code == cli.EXIT_OK
+    text = out.read_text()
+    assert "repo-a" in text
+    assert "repo-b" in text
