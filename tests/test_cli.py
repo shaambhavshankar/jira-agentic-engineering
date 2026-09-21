@@ -1,5 +1,7 @@
 """CLI wiring and exit codes. No network, no Keychain."""
 
+import json
+
 import pytest
 
 from jira_agent_kit import cli
@@ -1299,3 +1301,59 @@ def test_score_under_version_rejects_an_empty_version(monkeypatch, tmp_path, cap
 
     assert code == cli.EXIT_MISUSE
     assert "cannot be empty" in capsys.readouterr().err
+
+
+# --- slack-ingest ------------------------------------------------------------
+
+
+def _mention_payload(text="<@U123BOT> fix the flaky test", channel="C123"):
+    return {
+        "type": "event_callback",
+        "event": {
+            "type": "app_mention", "channel": channel, "user": "U999",
+            "text": text, "ts": "100.1",
+        },
+    }
+
+
+def test_slack_ingest_resolves_a_job_from_a_channel_map(tmp_path, capsys):
+    payload_file = tmp_path / "event.json"
+    payload_file.write_text(json.dumps(_mention_payload()))
+    channel_map_file = tmp_path / "channels.json"
+    channel_map_file.write_text(json.dumps({"C123": "repo-a"}))
+
+    code = cli.main(
+        [
+            "slack-ingest", "--payload-file", str(payload_file),
+            "--bot-user-id", "U123BOT", "--channel-map-file", str(channel_map_file),
+        ]
+    )
+
+    assert code == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "repo=repo-a" in out
+    assert "task_text=fix the flaky test" in out
+
+
+def test_slack_ingest_with_an_explicit_bracket_needs_no_channel_map(tmp_path, capsys):
+    payload_file = tmp_path / "event.json"
+    payload_file.write_text(json.dumps(_mention_payload(text="<@U123BOT> [repo-b] fix it")))
+
+    code = cli.main(
+        ["slack-ingest", "--payload-file", str(payload_file), "--bot-user-id", "U123BOT"]
+    )
+
+    assert code == cli.EXIT_OK
+    assert "repo=repo-b" in capsys.readouterr().out
+
+
+def test_slack_ingest_with_no_repo_resolvable_is_misuse_not_a_crash(tmp_path, capsys):
+    payload_file = tmp_path / "event.json"
+    payload_file.write_text(json.dumps(_mention_payload(channel="C_UNKNOWN")))
+
+    code = cli.main(
+        ["slack-ingest", "--payload-file", str(payload_file), "--bot-user-id", "U123BOT"]
+    )
+
+    assert code == cli.EXIT_MISUSE
+    assert "which repo" in capsys.readouterr().err

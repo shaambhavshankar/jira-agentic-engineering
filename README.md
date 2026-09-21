@@ -112,7 +112,24 @@ jira-agent sprints
 jira-agent dashboard [--apply]
 jira-agent whoami
 jira-agent lint some-file.md
+
+# JAE v2 -- telemetry, judge scoring, versioning, self-improvement, Slack
+jira-agent factory-dashboard [--repo NAME] [--out path.html]
+jira-agent factory-version tag NAME --note "..."
+jira-agent factory-version list
+jira-agent replay --repo-name NAME --issue KEY --session ID --dimension D \
+  [--from-version factory-vN] [--to-version factory-vM]
+jira-agent score-under-version --repo-name NAME --issue KEY --session ID \
+  --dimension D --version factory-vN --state-file path
+jira-agent self-improve-batch --dimension D [--repo-name NAME] [--min-sample N]
+jira-agent self-improve-propose --dimension D [--repo-name NAME] --proposal-file path
+jira-agent slack-ingest --payload-file event.json --bot-user-id U0123ABC \
+  [--channel-map-file channels.json]
 ```
+
+The JAE v2 layer's full design is written up as its own spec document,
+kept alongside whichever project first commissioned it. Slack setup is
+its own guide: `docs/SLACK_SETUP.md`.
 
 Full reference in `skills/jira/SKILL.md`.
 

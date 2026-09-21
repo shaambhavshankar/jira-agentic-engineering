@@ -17,6 +17,8 @@
         [--from-version factory-vN] [--to-version factory-vM]
     jira-agent score-under-version --repo-name NAME --issue KEY --session ID \
         --dimension D --version factory-vN --state-file path
+    jira-agent slack-ingest --payload-file event.json --bot-user-id U0123ABC \
+        [--channel-map-file channels.json]
     jira-agent self-improve-batch --dimension D [--repo-name NAME] [--min-sample N]
     jira-agent self-improve-propose --dimension D [--repo-name NAME] --proposal-file path
     jira-agent whoami
@@ -45,7 +47,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
-from jira_agent_kit import context, dashboard as dash, factory_dashboard, judge as judge_mod, schema, self_improve, telemetry, versioning
+from jira_agent_kit import context, dashboard as dash, factory_dashboard, judge as judge_mod, schema, self_improve, slack_ingress, telemetry, versioning
 from jira_agent_kit.client import JiraClient, JiraError, TokenMissing, read_token
 from jira_agent_kit.config import Config, ConfigError, load as load_config
 
@@ -166,6 +168,23 @@ def _parser(config: Config) -> argparse.ArgumentParser:
     self_improve_propose.add_argument(
         "--min-sample", type=int, default=None,
         help="override the default minimum sample size (20)",
+    )
+
+    slack_ingest = sub.add_parser(
+        "slack-ingest",
+        help="resolve a Slack app_mention payload into a job (repo + task text); does not create anything",
+    )
+    slack_ingest.add_argument(
+        "--payload-file", required=True,
+        help="path to the Slack Events API JSON payload (already signature-verified by the receiver)",
+    )
+    slack_ingest.add_argument(
+        "--bot-user-id", required=True,
+        help="this app's own Slack user id, e.g. U0123ABC -- strips it from the mention text",
+    )
+    slack_ingest.add_argument(
+        "--channel-map-file", default=None,
+        help="path to a JSON file of {channel_id: repo_name}; omit to require a [repo-name] override in every message",
     )
 
     transition = sub.add_parser("transition", help="move an issue to a new status")
@@ -781,6 +800,35 @@ def _do_replay(args) -> int:
     return EXIT_OK
 
 
+def _do_slack_ingest(args) -> int:
+    """Parse one already-verified Slack payload into a job. Prints it;
+    does not create anything. Turning the job into a real issue is a
+    real Claude Code session's job, per slack_ingress.py's own NG2-style
+    scope cut -- this command's output is that session's starting context.
+    """
+    import json
+
+    payload = json.loads(Path(args.payload_file).read_text())
+    channel_map = {}
+    if args.channel_map_file:
+        channel_map = json.loads(Path(args.channel_map_file).read_text())
+
+    try:
+        job = slack_ingress.parse_event(
+            payload, bot_user_id=args.bot_user_id, channel_map=channel_map,
+        )
+    except slack_ingress.IngressError as error:
+        print(str(error), file=sys.stderr)
+        return EXIT_MISUSE
+
+    print(f"repo={job.repo}")
+    print(f"channel={job.channel}")
+    print(f"thread_ts={job.thread_ts}")
+    print(f"user={job.user}")
+    print(f"task_text={job.task_text}")
+    return EXIT_OK
+
+
 def _do_score_under_version(args) -> int:
     """Score a task's state under a named factory version. The missing
     half of replay: versioning.score_under_version existed and was
@@ -876,7 +924,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("no command. Try: create, show, comment, block, start, finish, "
               "transition, sprints, dashboard, factory-dashboard, factory-version, "
               "replay, score-under-version, self-improve-batch, self-improve-propose, "
-              "whoami, lint", file=sys.stderr)
+              "slack-ingest, whoami, lint", file=sys.stderr)
         return EXIT_MISUSE
 
     vocab = schema.Vocabulary(config.label_prefix)
@@ -926,6 +974,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "score-under-version":
             return _do_score_under_version(args)
+
+        if args.command == "slack-ingest":
+            return _do_slack_ingest(args)
 
         if args.command == "self-improve-batch":
             return _do_self_improve_batch(args)
