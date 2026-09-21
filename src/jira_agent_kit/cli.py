@@ -15,6 +15,8 @@
     jira-agent factory-version list
     jira-agent replay --repo-name NAME --issue KEY --session ID --dimension D \
         [--from-version factory-vN] [--to-version factory-vM]
+    jira-agent score-under-version --repo-name NAME --issue KEY --session ID \
+        --dimension D --version factory-vN --state-file path
     jira-agent self-improve-batch --dimension D [--repo-name NAME] [--min-sample N]
     jira-agent self-improve-propose --dimension D [--repo-name NAME] --proposal-file path
     jira-agent whoami
@@ -122,6 +124,17 @@ def _parser(config: Config) -> argparse.ArgumentParser:
     replay.add_argument("--dimension", required=True, choices=sorted(judge_mod.DIMENSIONS))
     replay.add_argument("--from-version", default=None, help="a factory-vN tag, or omit for the live score")
     replay.add_argument("--to-version", default=None, help="a factory-vN tag, or omit for the live score")
+
+    score_version = sub.add_parser(
+        "score-under-version",
+        help="score a task's state under a named factory version, for later replay comparison",
+    )
+    score_version.add_argument("--repo-name", required=True, help="the repo tag in the telemetry store")
+    score_version.add_argument("--issue", required=True, help="issue key, e.g. PROJ-12")
+    score_version.add_argument("--session", required=True, help="session_id from telemetry")
+    score_version.add_argument("--dimension", required=True, choices=sorted(judge_mod.DIMENSIONS))
+    score_version.add_argument("--version", required=True, help="a factory-vN tag (never the live score -- use finish for that)")
+    score_version.add_argument("--state-file", required=True, help="path to the diff/text to score")
 
     self_improve_batch = sub.add_parser(
         "self-improve-batch",
@@ -768,6 +781,31 @@ def _do_replay(args) -> int:
     return EXIT_OK
 
 
+def _do_score_under_version(args) -> int:
+    """Score a task's state under a named factory version. The missing
+    half of replay: versioning.score_under_version existed and was
+    tested, but nothing in the CLI could ever call it for real -- found
+    only by trying to actually populate a replay comparison end to end.
+    """
+    if args.version.strip() == "":
+        print("--version cannot be empty. Use finish for the live score.", file=sys.stderr)
+        return EXIT_MISUSE
+
+    state = Path(args.state_file).read_text()
+    jev = judge_mod.JevJudge()
+    store = telemetry.TelemetryStore(_telemetry_db_path())
+    try:
+        versioning.score_under_version(
+            jev, store,
+            repo=args.repo_name, issue_key=args.issue, session_id=args.session,
+            dimension=args.dimension, state=state, factory_version=args.version,
+        )
+    finally:
+        store.close()
+    print(f"scored {args.issue}  {args.dimension}  under {args.version}")
+    return EXIT_OK
+
+
 def _do_self_improve_batch(args) -> int:
     """Select the batch and print the observer prompt. Does NOT call an
     LLM -- copy the printed prompt into a real Claude Code session, save
@@ -837,7 +875,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.command:
         print("no command. Try: create, show, comment, block, start, finish, "
               "transition, sprints, dashboard, factory-dashboard, factory-version, "
-              "replay, self-improve-batch, self-improve-propose, whoami, lint", file=sys.stderr)
+              "replay, score-under-version, self-improve-batch, self-improve-propose, "
+              "whoami, lint", file=sys.stderr)
         return EXIT_MISUSE
 
     vocab = schema.Vocabulary(config.label_prefix)
@@ -884,6 +923,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "replay":
             return _do_replay(args)
+
+        if args.command == "score-under-version":
+            return _do_score_under_version(args)
 
         if args.command == "self-improve-batch":
             return _do_self_improve_batch(args)

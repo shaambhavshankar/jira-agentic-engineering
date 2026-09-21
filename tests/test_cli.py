@@ -1253,3 +1253,49 @@ def test_self_improve_propose_refuses_below_minimum_without_creating_anything(mo
 
     assert code == cli.EXIT_MISUSE
     assert fake.created is None
+
+
+# --- score-under-version (the missing half of replay, found testing it) ----
+
+
+def test_score_under_version_writes_a_tagged_score(monkeypatch, tmp_path):
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    stub = _StubJudge({
+        "redundant_tests": _judge_result("redundant_tests", 0.3, 0.9, "write"),
+    })
+    monkeypatch.setattr(cli.judge_mod, "JevJudge", lambda: stub)
+
+    state_file = tmp_path / "state.txt"
+    state_file.write_text("some diff content")
+
+    code = cli.main(
+        [
+            "score-under-version", "--repo-name", "repo-a", "--issue", "A-1",
+            "--session", "s1", "--dimension", "redundant_tests",
+            "--version", "factory-v2", "--state-file", str(state_file),
+        ]
+    )
+
+    assert code == cli.EXIT_OK
+    store = cli.telemetry.TelemetryStore(tmp_path / "jae.db")
+    scores = store.scores(repo="repo-a", dimension="redundant_tests")
+    assert len(scores) == 1
+    assert scores[0]["factory_version"] == "factory-v2"
+    assert scores[0]["score"] == pytest.approx(0.3)
+
+
+def test_score_under_version_rejects_an_empty_version(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+    state_file = tmp_path / "state.txt"
+    state_file.write_text("x")
+
+    code = cli.main(
+        [
+            "score-under-version", "--repo-name", "repo-a", "--issue", "A-1",
+            "--session", "s1", "--dimension", "redundant_tests",
+            "--version", "", "--state-file", str(state_file),
+        ]
+    )
+
+    assert code == cli.EXIT_MISUSE
+    assert "cannot be empty" in capsys.readouterr().err
