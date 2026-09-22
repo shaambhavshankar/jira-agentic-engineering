@@ -657,6 +657,47 @@ def test_finish_telemetry_records_a_nonzero_test_exit_code(monkeypatch, tmp_path
     assert store.tasks(repo="test-repo")[0].test_exit_code == 1
 
 
+def test_finish_records_a_supplied_cost_and_pr_url(monkeypatch, tmp_path):
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setattr(cli.context, "changed_files", lambda rev, repo: ())
+    monkeypatch.setattr(cli.telemetry, "repo_name", lambda repo: "test-repo")
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+
+    cli.main(
+        [
+            "finish", "PROJ-12", "--test-cmd", "true", "--predicted", "",
+            "--accuracy", "Same|x.", "--scalability", "Same|x.", "--maintenance", "Same|x.",
+            "--left", "nothing",
+            "--cost-usd", "1.23", "--pr-url", "https://github.com/acme/repo/pull/9",
+        ]
+    )
+
+    task = cli.telemetry.TelemetryStore(tmp_path / "jae.db").tasks(repo="test-repo")[0]
+    assert task.cost_usd == pytest.approx(1.23)
+    assert task.pr_url == "https://github.com/acme/repo/pull/9"
+
+
+def test_finish_without_cost_or_pr_url_leaves_both_null(monkeypatch, tmp_path):
+    fake = _RecordingClient()
+    monkeypatch.setattr(cli, "_client", lambda config, email: fake)
+    monkeypatch.setattr(cli.context, "changed_files", lambda rev, repo: ())
+    monkeypatch.setattr(cli.telemetry, "repo_name", lambda repo: "test-repo")
+    monkeypatch.setenv("JIRA_AGENT_DB_PATH", str(tmp_path / "jae.db"))
+
+    cli.main(
+        [
+            "finish", "PROJ-12", "--test-cmd", "true", "--predicted", "",
+            "--accuracy", "Same|x.", "--scalability", "Same|x.", "--maintenance", "Same|x.",
+            "--left", "nothing",
+        ]
+    )
+
+    task = cli.telemetry.TelemetryStore(tmp_path / "jae.db").tasks(repo="test-repo")[0]
+    assert task.cost_usd is None
+    assert task.pr_url is None
+
+
 def test_finish_still_posts_the_report_when_telemetry_cannot_be_written(monkeypatch, tmp_path):
     """Best-effort, per spec §3.2: a telemetry write failure must never fail
     the finish command the way a Jira or network failure never does either.

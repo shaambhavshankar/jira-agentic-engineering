@@ -15,8 +15,10 @@ import pytest
 from jira_agent_kit.factory_dashboard import (
     DashboardStats,
     compute_stats,
+    mean_pr_review_wait_seconds,
     per_repo_breakdown,
     render_html,
+    sync_human_interactions,
 )
 from jira_agent_kit.telemetry import TaskRecord, TelemetryStore
 
@@ -211,3 +213,95 @@ def test_render_html_does_not_crash_on_an_empty_store():
     html = render_html(overall=empty, breakdown=())
 
     assert "0" in html
+
+
+# --- sync_human_interactions: real per-task comment-author counts -----------
+
+
+class _FakeJiraClient:
+    """Stands in for JiraClient -- only the two calls sync_human_interactions
+    actually uses.
+    """
+
+    def __init__(self, bot_account_id: str, authors_by_issue: dict[str, list[str | None]]):
+        self._bot_account_id = bot_account_id
+        self._authors_by_issue = authors_by_issue
+
+    def myself(self) -> dict:
+        return {"accountId": self._bot_account_id}
+
+    def list_comment_authors(self, key: str) -> list[str | None]:
+        return self._authors_by_issue[key]
+
+
+def test_sync_human_interactions_counts_authors_that_are_not_the_bot_account(tmp_path):
+    store = TelemetryStore(tmp_path / "t.db")
+    store.record(_record(issue_key="A-1", session_id="a", human_interactions=0))
+    client = _FakeJiraClient(
+        bot_account_id="bot-account",
+        authors_by_issue={"A-1": ["bot-account", "human-account", "human-account"]},
+    )
+
+    updated = sync_human_interactions(store, client)
+
+    assert updated == 1
+    assert compute_stats(store).mean_human_interactions == 2.0
+
+
+def test_sync_human_interactions_returns_zero_when_every_comment_is_the_bot_itself(tmp_path):
+    """The honest, real limitation of a setup with no separate bot account:
+    every comment looks self-authored, so the real count is 0 -- not a bug
+    in the count.
+    """
+    store = TelemetryStore(tmp_path / "t.db")
+    store.record(_record(issue_key="A-1", session_id="a", human_interactions=99))
+    client = _FakeJiraClient(
+        bot_account_id="same-account",
+        authors_by_issue={"A-1": ["same-account", "same-account"]},
+    )
+
+    sync_human_interactions(store, client)
+
+    assert compute_stats(store).mean_human_interactions == 0.0
+
+
+# --- mean_pr_review_wait_seconds ---------------------------------------------
+
+
+class _FakeRunner:
+    def __init__(self, stdout: str):
+        self.stdout = stdout
+
+    def __call__(self, cmd, **kwargs):
+        return type("Result", (), {"returncode": 0, "stdout": self.stdout, "stderr": ""})()
+
+
+def test_mean_pr_review_wait_seconds_averages_finish_to_first_review(tmp_path):
+    finished = datetime(2026, 9, 22, 10, 0, tzinfo=timezone.utc)
+    reviewed = datetime(2026, 9, 22, 10, 5, tzinfo=timezone.utc)  # 300s later
+    task = _record(
+        pr_url="https://github.com/acme/widgets/pull/1", finished_at=finished,
+    )
+    runner = _FakeRunner(
+        stdout=f'[{{"submitted_at": "{reviewed.isoformat().replace("+00:00", "Z")}"}}]'
+    )
+
+    result = mean_pr_review_wait_seconds([task], runner=runner)
+
+    assert result == 300.0
+
+
+def test_mean_pr_review_wait_seconds_excludes_tasks_with_no_pr_url(tmp_path):
+    task = _record(pr_url=None)
+
+    result = mean_pr_review_wait_seconds([task], runner=_FakeRunner(stdout="[]"))
+
+    assert result is None
+
+
+def test_mean_pr_review_wait_seconds_excludes_a_pr_with_no_review_yet(tmp_path):
+    task = _record(pr_url="https://github.com/acme/widgets/pull/1")
+
+    result = mean_pr_review_wait_seconds([task], runner=_FakeRunner(stdout="[]"))
+
+    assert result is None

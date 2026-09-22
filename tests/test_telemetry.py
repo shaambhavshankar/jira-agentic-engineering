@@ -33,6 +33,7 @@ def _record(**overrides) -> TaskRecord:
         contract_exit_code=None,
         human_interactions=0,
         cost_usd=None,
+        pr_url=None,
     )
     defaults.update(overrides)
     return TaskRecord(**defaults)
@@ -108,6 +109,53 @@ def test_cost_usd_round_trips_when_present(tmp_path):
     store.record(_record(cost_usd=0.42))
 
     assert store.tasks()[0].cost_usd == pytest.approx(0.42)
+
+
+def test_pr_url_is_none_by_default(tmp_path):
+    store = TelemetryStore(tmp_path / "jae.db")
+    store.record(_record())
+
+    assert store.tasks()[0].pr_url is None
+
+
+def test_pr_url_round_trips_when_present(tmp_path):
+    store = TelemetryStore(tmp_path / "jae.db")
+    store.record(_record(pr_url="https://github.com/acme/repo/pull/42"))
+
+    assert store.tasks()[0].pr_url == "https://github.com/acme/repo/pull/42"
+
+
+def test_opening_a_pre_existing_db_without_the_pr_url_column_still_works(tmp_path):
+    """The real ~/.jira-agent/jae.db predates pr_url -- a store built
+    against real data before this column existed must still open, not
+    crash, the next time TelemetryStore connects to it.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "jae.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE task_records (
+            issue_key TEXT NOT NULL, repo TEXT NOT NULL, session_id TEXT NOT NULL,
+            started_at TEXT NOT NULL, finished_at TEXT NOT NULL, model TEXT NOT NULL,
+            files_changed TEXT NOT NULL, test_exit_code INTEGER NOT NULL,
+            contract_exit_code INTEGER, human_interactions INTEGER NOT NULL,
+            cost_usd REAL, PRIMARY KEY (repo, issue_key, session_id)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO task_records VALUES ('OLD-1','r','s1','2026-01-01T00:00:00','2026-01-01T00:00:00','m','[]',0,NULL,0,NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = TelemetryStore(db_path)  # must not raise
+    tasks = store.tasks()
+
+    assert tasks[0].issue_key == "OLD-1"
+    assert tasks[0].pr_url is None
 
 
 # --- per-repo vs pooled reads: the whole point of §3.4 ----------------------

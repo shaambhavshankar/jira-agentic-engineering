@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS task_records (
     contract_exit_code  INTEGER,
     human_interactions  INTEGER NOT NULL,
     cost_usd            REAL,
+    pr_url              TEXT,
     PRIMARY KEY (repo, issue_key, session_id)
 );
 
@@ -104,6 +105,7 @@ class TaskRecord:
     contract_exit_code: int | None
     human_interactions: int
     cost_usd: float | None
+    pr_url: str | None = None
 
 
 class TelemetryStore:
@@ -120,7 +122,22 @@ class TelemetryStore:
         self._conn = sqlite3.connect(self.db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add a column to a table_records file that predates it.
+
+        `CREATE TABLE IF NOT EXISTS` only creates a table that doesn't
+        exist yet -- it does nothing to an existing table missing a
+        column a newer version of this schema added. The real
+        ~/.jira-agent/jae.db predates `pr_url`; without this, opening it
+        after this change would silently read every pr_url as absent from
+        the row tuple rather than as the column that's actually missing.
+        """
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(task_records)")}
+        if "pr_url" not in columns:
+            self._conn.execute("ALTER TABLE task_records ADD COLUMN pr_url TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -144,8 +161,8 @@ class TelemetryStore:
             INSERT INTO task_records (
                 issue_key, repo, session_id, started_at, finished_at, model,
                 files_changed, test_exit_code, contract_exit_code,
-                human_interactions, cost_usd
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                human_interactions, cost_usd, pr_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (repo, issue_key, session_id) DO UPDATE SET
                 started_at=excluded.started_at,
                 finished_at=excluded.finished_at,
@@ -154,7 +171,8 @@ class TelemetryStore:
                 test_exit_code=excluded.test_exit_code,
                 contract_exit_code=excluded.contract_exit_code,
                 human_interactions=excluded.human_interactions,
-                cost_usd=excluded.cost_usd
+                cost_usd=excluded.cost_usd,
+                pr_url=excluded.pr_url
             """,
             (
                 task.issue_key,
@@ -168,6 +186,7 @@ class TelemetryStore:
                 task.contract_exit_code,
                 task.human_interactions,
                 task.cost_usd,
+                task.pr_url,
             ),
         )
         self._conn.commit()
@@ -276,7 +295,7 @@ def _row_to_task(row: Sequence) -> TaskRecord:
     (
         issue_key, repo, session_id, started_at, finished_at, model,
         files_changed, test_exit_code, contract_exit_code,
-        human_interactions, cost_usd,
+        human_interactions, cost_usd, pr_url,
     ) = row
     return TaskRecord(
         issue_key=issue_key,
@@ -290,6 +309,7 @@ def _row_to_task(row: Sequence) -> TaskRecord:
         contract_exit_code=contract_exit_code,
         human_interactions=human_interactions,
         cost_usd=cost_usd,
+        pr_url=pr_url,
     )
 
 

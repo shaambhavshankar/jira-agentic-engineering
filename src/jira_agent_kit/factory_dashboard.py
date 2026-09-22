@@ -7,27 +7,38 @@ step in, what did it cost, how long did work take. The pooled view is the
 direct build-out of "multi-repo with learnings and judge for each
 individual repo and overall as well."
 
-WHAT THIS DOES NOT COMPUTE, ON PURPOSE. The spec's original draft (§4.1)
-described splitting cycle time into "kickoff-to-PR" and "PR-to-first-
-human-review." The second half needs Jira comment timestamps and GitHub PR
-review timestamps -- neither is in TelemetryStore yet, and neither has a
-read integration built in this item. Reporting a number for it anyway
-would be a fabrication, exactly what docs/verifying-your-own-work.md
-warns against. This module reports `mean_kickoff_to_finish_seconds`
-instead -- the true duration this kit DOES measure (started_at to
-finished_at, per TaskRecord) -- and leaves the human-review split as a
-named gap for whichever item wires in the Jira/GitHub reads. A missing
-number here is honest; a wrong one is worse than no dashboard at all.
+WHAT `compute_stats` DOES NOT DO: hit the network. It reads only what is
+already in TelemetryStore, on purpose -- the dashboard's main render path
+must stay fast and offline. Two things it needs a live credential for --
+who wrote each Jira comment, and when a PR's first human review landed --
+are separate, opt-in sync functions below (`sync_human_interactions`,
+`mean_pr_review_wait_seconds`), wired to a `--sync` flag on the CLI
+rather than run on every render.
+
+`sync_human_interactions` HAS A REAL LIMITATION IN THIS KIT'S OWN
+DOGFOOD SETUP: it counts a comment as human by comparing its author
+against the automation credential's own account id, and in this kit's
+own Jira project, the automation token IS the human operator's personal
+account -- there is no separate bot account. Every comment on a JAE issue
+looks self-authored by that heuristic, so it will always compute 0
+against this project's own telemetry. That is a true fact about how this
+project's automation is set up, not a bug in the count -- a team running
+a real bot/service account will get real, non-zero counts.
 """
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from jira_agent_kit.telemetry import TelemetryStore
+from jira_agent_kit import github_reads
+from jira_agent_kit.telemetry import TaskRecord, TelemetryStore
 
-__all__ = ["DashboardStats", "compute_stats", "per_repo_breakdown", "render_html"]
+__all__ = [
+    "DashboardStats", "compute_stats", "mean_pr_review_wait_seconds",
+    "per_repo_breakdown", "render_html", "sync_human_interactions",
+]
 
 
 @dataclass(frozen=True)
@@ -72,6 +83,54 @@ def compute_stats(store: TelemetryStore, repo: str | None = None) -> DashboardSt
         total_cost_usd=sum(known_costs) if known_costs else None,
         mean_kickoff_to_finish_seconds=sum(durations) / len(durations),
     )
+
+
+def sync_human_interactions(store: TelemetryStore, client, *, repo: str | None = None) -> int:
+    """Count real non-bot Jira comments per task and write them back.
+
+    "Non-bot" means "not the automation credential's own account id" --
+    `client.myself()["accountId"]` is the one fact that lets a comment
+    count be a real signal instead of a total that includes the
+    automation's own status comments. Returns how many task rows were
+    updated, so a caller can report a real number rather than assuming
+    success.
+    """
+    bot_account_id = client.myself()["accountId"]
+    tasks = store.tasks(repo=repo)
+    for task in tasks:
+        authors = client.list_comment_authors(task.issue_key)
+        human_count = sum(1 for author in authors if author != bot_account_id)
+        store.update_human_interactions(
+            repo=task.repo, issue_key=task.issue_key,
+            session_id=task.session_id, count=human_count,
+        )
+    return len(tasks)
+
+
+def mean_pr_review_wait_seconds(
+    tasks: Sequence[TaskRecord], *, runner=subprocess.run
+) -> float | None:
+    """Mean seconds from a task's `finished_at` to its PR's first human
+    review, over every task with a `pr_url` that has been reviewed.
+
+    `finished_at` stands in for "PR opened at" -- this kit does not record
+    a separate PR-open timestamp, and `finish` is the moment a task's PR
+    is realistically ready for review, so it's the honest anchor available
+    rather than a fabricated one. A task with no `pr_url`, or a `pr_url`
+    with no review yet, is excluded rather than counted as a zero wait --
+    an unreviewed PR is not a fast review, it's an unmeasured one. `None`
+    when nothing qualifies, same "unknown, not zero" convention as every
+    other field here.
+    """
+    waits: list[float] = []
+    for task in tasks:
+        if task.pr_url is None:
+            continue
+        reviewed_at = github_reads.first_human_review_at(task.pr_url, runner=runner)
+        if reviewed_at is None:
+            continue
+        waits.append((reviewed_at - task.finished_at).total_seconds())
+    return sum(waits) / len(waits) if waits else None
 
 
 def per_repo_breakdown(store: TelemetryStore) -> tuple[DashboardStats, ...]:
@@ -134,8 +193,11 @@ def render_html(overall: DashboardStats, breakdown: Sequence[DashboardStats]) ->
         "</tr></thead>"
         f"<tbody>{''.join(rows)}</tbody>"
         "</table>"
-        "<p>PR-to-first-human-review is not shown: it needs Jira comment "
-        "and GitHub PR review timestamps this item does not read yet. "
-        "See factory_dashboard.py's module docstring.</p>"
+        "<p>Human interactions and PR-to-first-human-review both need a "
+        "network read (Jira comments, GitHub PR reviews) this table does "
+        "not do on every render. Run <code>jira-agent factory-dashboard "
+        "--sync</code> to refresh human-interaction counts first, or see "
+        "factory_dashboard.py's module docstring for the PR-review-wait "
+        "computation.</p>"
         "</body></html>"
     )

@@ -248,6 +248,20 @@ class JiraClient:
             bodies.append(" ".join(runs).strip())
         return bodies
 
+    def list_comment_authors(self, key: str, limit: int = 100) -> list[str | None]:
+        """The `accountId` of every comment's author, oldest first.
+
+        A large default page (100, not list_comments's 3) -- this exists
+        to COUNT, not to display, and undercounting a busy issue's real
+        comment history would silently understate human_interactions.
+        `None` for a comment with no author on the response (rare, but a
+        malformed response must not crash a count) rather than raising.
+        """
+        payload = self._json(
+            self._request("GET", f"/issue/{key}/comment?maxResults={limit}")
+        )
+        return [comment.get("author", {}).get("accountId") for comment in payload.get("comments", [])]
+
     def add_labels(self, key: str, labels: Sequence[str], vocabulary: Vocabulary) -> None:
         """Add labels without touching the ones already there.
 

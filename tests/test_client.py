@@ -205,6 +205,41 @@ def test_list_comments_returns_newest_first_and_respects_the_limit():
     assert "orderBy=-created" in seen["url"]
 
 
+def test_list_comment_authors_returns_the_accountid_per_comment():
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "comments": [
+                    {"author": {"accountId": "acc-bot"}},
+                    {"author": {"accountId": "acc-human"}},
+                ]
+            },
+        )
+
+    got = _client(handler).list_comment_authors("PROJ-10")
+    assert got == ["acc-bot", "acc-human"]
+
+
+def test_list_comment_authors_treats_a_missing_author_as_unknown_not_a_crash():
+    def handler(request):
+        return httpx.Response(200, json={"comments": [{"body": {}}]})  # no "author" key at all
+
+    got = _client(handler).list_comment_authors("PROJ-10")
+    assert got == [None]
+
+
+def test_list_comment_authors_requests_a_large_page_by_default():
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"comments": []})
+
+    _client(handler).list_comment_authors("PROJ-10")
+    assert "maxResults=100" in seen["url"]
+
+
 def test_add_labels_uses_the_update_verb_so_existing_labels_survive():
     seen = {}
 

@@ -107,6 +107,12 @@ def _parser(config: Config) -> argparse.ArgumentParser:
         "--out", default="factory-dashboard.html",
         help="output HTML file path",
     )
+    factory_dash.add_argument(
+        "--sync", action="store_true",
+        help="before rendering, query Jira for real human-interaction counts "
+             "and print the mean PR-review wait -- a network read, so opt-in, "
+             "not run on every render",
+    )
 
     factory_version = sub.add_parser(
         "factory-version", help="tag or list named snapshots of the factory definition"
@@ -222,6 +228,14 @@ def _parser(config: Config) -> argparse.ArgumentParser:
     finish.add_argument("--scalability", required=True, metavar="Verdict|sentence")
     finish.add_argument("--maintenance", required=True, metavar="Verdict|sentence")
     finish.add_argument("--left", required=True, help='what is undone, even if "nothing"')
+    finish.add_argument(
+        "--cost-usd", type=float, default=None,
+        help="real cost of this task, if your own harness tracked it -- never guessed, stays null when omitted",
+    )
+    finish.add_argument(
+        "--pr-url", default=None,
+        help="the GitHub PR this task produced, if any -- enables PR-review split cycle time in factory-dashboard",
+    )
 
     create = sub.add_parser("create", help="create an issue from the template")
     create.add_argument("--type", required=True, help="e.g. task, bug, epic, subtask")
@@ -447,6 +461,8 @@ def _record_telemetry_and_score(
     test_exit_code: int,
     contract_exit_code: int | None,
     judge_state: str,
+    cost_usd: float | None = None,
+    pr_url: str | None = None,
 ) -> None:
     """Write one TaskRecord for this `finish` call, and -- if this issue
     is sampled -- score it on every dimension in judge.DIMENSIONS. Both
@@ -486,7 +502,8 @@ def _record_telemetry_and_score(
                     test_exit_code=test_exit_code,
                     contract_exit_code=contract_exit_code,
                     human_interactions=0,  # computed later, by the dashboard (spec §4.2)
-                    cost_usd=None,  # not available at this layer yet
+                    cost_usd=cost_usd,  # real only if the caller's own harness supplied one
+                    pr_url=pr_url,
                 )
             )
 
@@ -681,6 +698,8 @@ def _do_finish(args, config: Config) -> int:
         test_exit_code=verdict.exit_code,
         contract_exit_code=contract_result.exit_code if args.contract_cmd else None,
         judge_state="\n".join(lines),
+        cost_usd=args.cost_usd,
+        pr_url=args.pr_url,
     )
 
     print(f"posted finish report on {args.key}" + (f", labelled {', '.join(hurt)}" if hurt else ""))
@@ -730,12 +749,27 @@ def _do_dashboard(args, config: Config) -> int:
     return EXIT_OK
 
 
-def _do_factory_dashboard(args) -> int:
+def _do_factory_dashboard(args, config: Config) -> int:
     """Render the manager dashboard: `--repo` scopes to one repo; omitted,
     it pools every repo in the shared telemetry store (spec §4.4).
+
+    `--sync` runs the two network reads first: real human-interaction
+    counts (per task, from Jira comments) and the mean PR-review wait
+    (per task with a pr_url, from GitHub). Neither runs by default --
+    every other dashboard render stays a pure, offline DB read.
     """
     store = telemetry.TelemetryStore(_telemetry_db_path())
     try:
+        if args.sync:
+            client = _client(config, args.email)
+            updated = factory_dashboard.sync_human_interactions(store, client, repo=args.repo)
+            print(f"synced human_interactions for {updated} task(s)")
+            wait = factory_dashboard.mean_pr_review_wait_seconds(store.tasks(repo=args.repo))
+            if wait is not None:
+                print(f"mean PR-review wait: {wait / 60:.0f} min")
+            else:
+                print("mean PR-review wait: unknown (no task with a reviewed pr_url)")
+
         overall = factory_dashboard.compute_stats(store, repo=args.repo)
         breakdown = () if args.repo else factory_dashboard.per_repo_breakdown(store)
     finally:
@@ -964,7 +998,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _do_dashboard(args, config)
 
         if args.command == "factory-dashboard":
-            return _do_factory_dashboard(args)
+            return _do_factory_dashboard(args, config)
 
         if args.command == "factory-version":
             return _do_factory_version(args)
